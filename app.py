@@ -16,11 +16,12 @@ import random
 import sqlite3
 import time
 from collections import deque
-from contextlib import closing
+from contextlib import asynccontextmanager, closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -53,7 +54,40 @@ PTY_LABELS = {
     7: "눈날림",
 }
 
-app = FastAPI(title="myAISky", version="0.1.0")
+# ---------------------------------------------------------------------------
+# 자동 수집 스케줄러 (기본 10분 주기, 서버 프로세스 안에서 실행)
+# ---------------------------------------------------------------------------
+COLLECT_INTERVAL_MIN = int(os.getenv("COLLECT_INTERVAL_MIN", "10"))
+scheduler = BackgroundScheduler(timezone=KST)
+
+
+def scheduled_collect() -> None:
+    """주기적으로 실측 데이터를 수집해 weather_logs에 적재한다."""
+    try:
+        get_weather(force=True)
+    except Exception as exc:  # 예외가 나도 스케줄러가 멈추지 않도록 보호
+        add_log("WARN", f"스케줄 수집 실패 ({exc})")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    scheduler.add_job(
+        scheduled_collect,
+        "interval",
+        minutes=COLLECT_INTERVAL_MIN,
+        next_run_time=datetime.now(KST),  # 기동 직후 1회 즉시 수집
+        id="collect_weather",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    add_log("AGENT", f"자동 수집 스케줄러 시작 ({COLLECT_INTERVAL_MIN}분 주기)")
+    yield
+    scheduler.shutdown(wait=False)
+
+
+app = FastAPI(title="myAISky", version="0.1.0", lifespan=lifespan)
 app.mount("/images", StaticFiles(directory=IMAGE_DIR), name="images")
 
 # 메모리 상태 (1교시: DB 없이 프로세스 메모리에 보관)
