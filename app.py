@@ -4,16 +4,19 @@
     uvicorn app:app --reload --host 0.0.0.0 --port 8000
 
 환경 변수:
-    KMA_SERVICE_KEY  기상청(공공데이터포털) 발급 서비스 키. 없으면 DEMO 데이터로 동작.
-    KMA_NX / KMA_NY  기상청 격자 좌표 (기본: 서울 60, 127).
+    KMA_SERVICE_KEY  기상청(공공데이터포털) 발급 서비스 키 (필수, 요청 serviceKey로 사용).
+                     없거나 호출 실패 시 DEMO 데이터로 대체.
+    KMA_NX / KMA_NY  기상청 격자 좌표 (기본: nx=55, ny=127).
 """
 from __future__ import annotations
 
 import math
 import os
 import random
+import sqlite3
 import time
 from collections import deque
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,32 +35,13 @@ REPORT_DIR.mkdir(exist_ok=True)
 KST = timezone(timedelta(hours=9), name="KST")  # 한국은 DST가 없어 고정 오프셋 사용 (Windows tzdata 불필요)
 
 # 기상청 초단기실황 조회 API (공공데이터포털)
-KMA_URL = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
+KMA_BASE_URL = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
+KMA_URL = f"{KMA_BASE_URL}/getUltraSrtNcst"
 KMA_SERVICE_KEY = os.getenv("KMA_SERVICE_KEY", "")
-KMA_NX = int(os.getenv("KMA_NX", "60"))
-KMA_NY = int(os.getenv("KMA_NY", "127"))
+KMA_NX = int(os.getenv("KMA_NX", "55"))   # 서울 격자 X
+KMA_NY = int(os.getenv("KMA_NY", "127"))  # 서울 격자 Y
 CACHE_TTL_SEC = 600  # 기상 데이터 캐시 (10분)
-
-# 날씨 제공자: "open-meteo"(글로벌, 키 불필요, 기본값) 또는 "kma"(기상청, 키 필요)
-WEATHER_PROVIDER = os.getenv("WEATHER_PROVIDER", "open-meteo").lower()
-# Open-Meteo 좌표 (기본: 서울). 전 세계 어디든 위도/경도로 변경 가능
-LATITUDE = float(os.getenv("LATITUDE", "37.5665"))
-LONGITUDE = float(os.getenv("LONGITUDE", "126.9780"))
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
-
-# WMO 날씨 코드 → 한국어 상태
-WMO_LABELS = {
-    0: "맑음", 1: "대체로 맑음", 2: "구름 조금", 3: "흐림",
-    45: "안개", 48: "짙은 안개",
-    51: "약한 이슬비", 53: "이슬비", 55: "강한 이슬비",
-    56: "약한 어는 이슬비", 57: "어는 이슬비",
-    61: "약한 비", 63: "비", 65: "강한 비",
-    66: "약한 어는 비", 67: "어는 비",
-    71: "약한 눈", 73: "눈", 75: "강한 눈", 77: "싸락눈",
-    80: "약한 소나기", 81: "소나기", 82: "강한 소나기",
-    85: "약한 눈보라", 86: "강한 눈보라",
-    95: "뇌우", 96: "우박을 동반한 뇌우", 99: "강한 우박 뇌우",
-}
+SOURCE_NAME = "Korea Meteorological Administration (KMA)"  # 대시보드·로그에 표시되는 출처
 
 PTY_LABELS = {
     0: "강수 없음",
@@ -84,6 +68,36 @@ def add_log(level: str, message: str) -> None:
         "level": level,
         "message": message,
     })
+
+
+# ---------------------------------------------------------------------------
+# SQLite 적재 (weather_logs.db → weather_logs 테이블)
+# ---------------------------------------------------------------------------
+DB_PATH = BASE_DIR / "weather_logs.db"
+
+
+def init_db() -> None:
+    """weather_logs 테이블이 없으면 생성한다."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weather_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                temperature REAL NOT NULL,
+                condition   TEXT NOT NULL
+            )
+            """
+        )
+
+
+def save_weather_log(data: dict) -> None:
+    """실측 기온·날씨 상태·시각을 weather_logs 테이블에 한 행 INSERT 한다."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute(
+            "INSERT INTO weather_logs (timestamp, temperature, condition) VALUES (?, ?, ?)",
+            (data["timestamp"], data["temperature"], data["status"]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -126,34 +140,7 @@ def fetch_kma_current_weather() -> dict:
         "precipitation_type": PTY_LABELS.get(pty, "알 수 없음"),
         "status": PTY_LABELS.get(pty, "알 수 없음"),
         "observed_at": base.strftime("%Y-%m-%d %H:%M KST"),
-        "source": "KMA",
-        "is_demo": False,
-    }
-
-
-def fetch_open_meteo_current_weather() -> dict:
-    """Open-Meteo (글로벌 무료 API, 키 불필요)로 현재 기상 데이터를 가져온다."""
-    params = {
-        "latitude": LATITUDE,
-        "longitude": LONGITUDE,
-        "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code",
-        "wind_speed_unit": "ms",   # 풍속 단위를 m/s로
-        "timezone": "auto",
-    }
-    resp = requests.get(OPEN_METEO_URL, params=params, timeout=8)
-    resp.raise_for_status()
-    current = resp.json()["current"]
-    code = int(current["weather_code"])
-    label = WMO_LABELS.get(code, "알 수 없음")
-
-    return {
-        "temperature": float(current["temperature_2m"]),
-        "humidity": float(current["relative_humidity_2m"]),
-        "wind_speed": float(current["wind_speed_10m"]),
-        "precipitation_type": label,
-        "status": label,
-        "observed_at": current["time"].replace("T", " ") + f" (lat {LATITUDE}, lon {LONGITUDE})",
-        "source": "Open-Meteo",
+        "source": SOURCE_NAME,
         "is_demo": False,
     }
 
@@ -181,13 +168,17 @@ def get_weather(force: bool = False) -> dict:
         return _cache["data"]
 
     try:
-        if WEATHER_PROVIDER == "kma":
-            data = fetch_kma_current_weather()
-        else:
-            data = fetch_open_meteo_current_weather()
+        data = fetch_kma_current_weather()
     except Exception as exc:  # 네트워크/키/응답 오류 → 대시보드는 계속 동작
         add_log("WARN", f"실데이터 사용 불가, DEMO 데이터로 대체 ({exc})")
         data = demo_weather()
+
+    data["timestamp"] = datetime.now(KST).isoformat(timespec="seconds")
+    if not data["is_demo"]:  # DEMO(시뮬레이션) 값은 실측 로그에 적재하지 않는다
+        try:
+            save_weather_log(data)
+        except sqlite3.Error as exc:
+            add_log("WARN", f"DB 저장 실패 ({exc})")
 
     _cache.update(data=data, ts=now)
     history.append({
@@ -198,6 +189,7 @@ def get_weather(force: bool = False) -> dict:
     return data
 
 
+init_db()
 add_log("BOOT", "myAISky 백엔드 시작")
 add_log("AGENT", "모니터링 에이전트 대기 중")
 
@@ -378,7 +370,7 @@ DASHBOARD_HTML = """<!doctype html>
 
   <section class="stats">
     <div class="card stat"><div class="label">현재 기온</div><div class="value" id="temp">--</div></div>
-    <div class="card stat"><div class="label">날씨 상태</div><div class="value" id="status">--</div></div>
+    <div class="card stat"><div class="label">날씨 상태</div><div class="value"><span id="icon" aria-hidden="true"></span> <span id="status">--</span></div></div>
     <div class="card stat"><div class="label">습도</div><div class="value" id="humidity">--</div></div>
     <div class="card stat"><div class="label">풍속</div><div class="value" id="wind">--</div></div>
   </section>
@@ -430,8 +422,21 @@ DASHBOARD_HTML = """<!doctype html>
     el.style.color = isError ? "#B5533C" : "var(--muted)";
   }
 
+  function iconFor(status) {
+    if (status.includes("뇌우")) return "⛈️";
+    if (status.includes("눈")) return "❄️";
+    if (status.includes("비") || status.includes("소나기")) return "🌧️";
+    if (status.includes("안개")) return "🌫️";
+    if (status.includes("흐림")) return "☁️";
+    if (status.includes("구름")) return "⛅";
+    if (status.includes("맑음")) return "☀️";
+    if (status.includes("강수 없음")) return "🌤️";
+    return "🌡️";
+  }
+
   function renderWeather(w) {
     $("temp").textContent = `${w.temperature.toFixed(1)}°C`;
+    $("icon").textContent = iconFor(w.status);
     $("status").textContent = w.status;
     $("humidity").textContent = `${w.humidity}%`;
     $("wind").textContent = `${w.wind_speed} m/s`;
