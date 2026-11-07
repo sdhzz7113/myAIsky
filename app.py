@@ -4,16 +4,20 @@
     uvicorn app:app --reload --host 0.0.0.0 --port 8000
 
 환경 변수:
-    KMA_SERVICE_KEY  기상청(공공데이터포털) 발급 서비스 키. 없으면 DEMO 데이터로 동작.
-    KMA_NX / KMA_NY  기상청 격자 좌표 (기본: 서울 60, 127).
+    KMA_SERVICE_KEY  기상청(공공데이터포털) 발급 서비스 키 (필수, 요청 serviceKey로 사용).
+                     없거나 호출 실패 시 DEMO 데이터로 대체.
+    KMA_NX / KMA_NY  기상청 격자 좌표 (기본: nx=55, ny=127).
+    WEATHER_PROVIDER "kma"(기본) 또는 "open-meteo".
 """
 from __future__ import annotations
 
 import math
 import os
 import random
+import sqlite3
 import time
 from collections import deque
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,14 +36,15 @@ REPORT_DIR.mkdir(exist_ok=True)
 KST = timezone(timedelta(hours=9), name="KST")  # 한국은 DST가 없어 고정 오프셋 사용 (Windows tzdata 불필요)
 
 # 기상청 초단기실황 조회 API (공공데이터포털)
-KMA_URL = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getUltraSrtNcst"
+KMA_BASE_URL = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0"
+KMA_URL = f"{KMA_BASE_URL}/getUltraSrtNcst"
 KMA_SERVICE_KEY = os.getenv("KMA_SERVICE_KEY", "")
-KMA_NX = int(os.getenv("KMA_NX", "60"))
-KMA_NY = int(os.getenv("KMA_NY", "127"))
+KMA_NX = int(os.getenv("KMA_NX", "55"))   # 서울 격자 X
+KMA_NY = int(os.getenv("KMA_NY", "127"))  # 서울 격자 Y
 CACHE_TTL_SEC = 600  # 기상 데이터 캐시 (10분)
 
-# 날씨 제공자: "open-meteo"(글로벌, 키 불필요, 기본값) 또는 "kma"(기상청, 키 필요)
-WEATHER_PROVIDER = os.getenv("WEATHER_PROVIDER", "open-meteo").lower()
+# 날씨 제공자: "kma"(기상청, 기본값, KMA_SERVICE_KEY 필요) 또는 "open-meteo"(키 불필요)
+WEATHER_PROVIDER = os.getenv("WEATHER_PROVIDER", "kma").lower()
 # Open-Meteo 좌표 (기본: 서울). 전 세계 어디든 위도/경도로 변경 가능
 LATITUDE = float(os.getenv("LATITUDE", "37.5665"))
 LONGITUDE = float(os.getenv("LONGITUDE", "126.9780"))
@@ -84,6 +89,36 @@ def add_log(level: str, message: str) -> None:
         "level": level,
         "message": message,
     })
+
+
+# ---------------------------------------------------------------------------
+# SQLite 적재 (weather_logs.db → weather_logs 테이블)
+# ---------------------------------------------------------------------------
+DB_PATH = BASE_DIR / "weather_logs.db"
+
+
+def init_db() -> None:
+    """weather_logs 테이블이 없으면 생성한다."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS weather_logs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL,
+                temperature REAL NOT NULL,
+                condition   TEXT NOT NULL
+            )
+            """
+        )
+
+
+def save_weather_log(data: dict) -> None:
+    """실측 기온·날씨 상태·시각을 weather_logs 테이블에 한 행 INSERT 한다."""
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute(
+            "INSERT INTO weather_logs (timestamp, temperature, condition) VALUES (?, ?, ?)",
+            (data["timestamp"], data["temperature"], data["status"]),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +224,13 @@ def get_weather(force: bool = False) -> dict:
         add_log("WARN", f"실데이터 사용 불가, DEMO 데이터로 대체 ({exc})")
         data = demo_weather()
 
+    data["timestamp"] = datetime.now(KST).isoformat(timespec="seconds")
+    if not data["is_demo"]:  # DEMO(시뮬레이션) 값은 실측 로그에 적재하지 않는다
+        try:
+            save_weather_log(data)
+        except sqlite3.Error as exc:
+            add_log("WARN", f"DB 저장 실패 ({exc})")
+
     _cache.update(data=data, ts=now)
     history.append({
         "time": datetime.now(KST).strftime("%H:%M"),
@@ -198,6 +240,7 @@ def get_weather(force: bool = False) -> dict:
     return data
 
 
+init_db()
 add_log("BOOT", "myAISky 백엔드 시작")
 add_log("AGENT", "모니터링 에이전트 대기 중")
 
@@ -378,7 +421,7 @@ DASHBOARD_HTML = """<!doctype html>
 
   <section class="stats">
     <div class="card stat"><div class="label">현재 기온</div><div class="value" id="temp">--</div></div>
-    <div class="card stat"><div class="label">날씨 상태</div><div class="value" id="status">--</div></div>
+    <div class="card stat"><div class="label">날씨 상태</div><div class="value"><span id="icon" aria-hidden="true"></span> <span id="status">--</span></div></div>
     <div class="card stat"><div class="label">습도</div><div class="value" id="humidity">--</div></div>
     <div class="card stat"><div class="label">풍속</div><div class="value" id="wind">--</div></div>
   </section>
@@ -430,8 +473,21 @@ DASHBOARD_HTML = """<!doctype html>
     el.style.color = isError ? "#B5533C" : "var(--muted)";
   }
 
+  function iconFor(status) {
+    if (status.includes("뇌우")) return "⛈️";
+    if (status.includes("눈")) return "❄️";
+    if (status.includes("비") || status.includes("소나기")) return "🌧️";
+    if (status.includes("안개")) return "🌫️";
+    if (status.includes("흐림")) return "☁️";
+    if (status.includes("구름")) return "⛅";
+    if (status.includes("맑음")) return "☀️";
+    if (status.includes("강수 없음")) return "🌤️";
+    return "🌡️";
+  }
+
   function renderWeather(w) {
     $("temp").textContent = `${w.temperature.toFixed(1)}°C`;
+    $("icon").textContent = iconFor(w.status);
     $("status").textContent = w.status;
     $("humidity").textContent = `${w.humidity}%`;
     $("wind").textContent = `${w.wind_speed} m/s`;
